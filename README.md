@@ -1,26 +1,36 @@
+# ARM Unicorn 虚拟原型项目
 
-这是一款基于unicorn的虚拟原型项目。
-项目骨架：目录结构、依赖、最小可跑代码（CPU+MMIO UART），以及如何编译一段裸机 “Hello, World” 固件喂给它运行。
+这是一款基于unicorn的虚拟原型项目。现在包含两个原型：
+
+1. **ARMv7 原型** - 基础的 Unicorn ARMv7 虚拟机
+2. **Cortex-M0 事件驱动原型** - 支持指令驱动虚拟时钟、事件队列和带时序的 UART
 
 ---
 
-# 目录结构（建议）
+## 目录结构
 
 ```
-armv7_unicorn/
+arm_unicorn/
 ├─ requirements.txt
-├─ run.py                  # 入口：装载固件、跑CPU、串口输出
+├─ run.py                  # ARMv7 入口：装载固件、跑CPU、串口输出
+├─ run_cm0.py              # Cortex-M0 入口：事件驱动原型
 ├─ soc/
 │  ├─ __init__.py
 │  ├─ cpu.py               # Unicorn ARMv7 封装
 │  ├─ bus.py               # 简易地址解码/分发
-│  └─ uart.py              # MMIO UART 外设（把写入当作打印）
+│  ├─ uart.py              # MMIO UART 外设（把写入当作打印）
+│  ├─ vclock.py            # VirtualClock + EventLoop（时钟和事件系统）
+│  └─ uart_timing.py       # 带时序的 UART（支持波特率、位时间模拟）
 └─ fw/
-   ├─ hello.c              # 裸机例子（写MMIO UART）
-   └─ build.sh             # 用 arm-none-eabi-gcc 编译
+   ├─ hello.c              # ARMv7 裸机例子（写MMIO UART）
+   ├─ hello_cm0.c          # Cortex-M0 裸机例子
+   ├─ startup_cm0.c        # Cortex-M0 向量表 + Reset_Handler
+   ├─ cortex-m0.ld         # Cortex-M0 链接脚本
+   ├─ build.sh             # 用 arm-none-eabi-gcc 编译 ARMv7
+   └─ build_cm0.sh         # 用 arm-none-eabi-gcc 编译 Cortex-M0
 ```
 
-`requirements.txt`
+## 依赖
 
 ```
 unicorn
@@ -30,232 +40,222 @@ pyelftools
 
 ---
 
-# 1) 最小外设：MMIO UART（Python）
+## Cortex-M0 事件驱动原型
 
-`soc/uart.py`
+### 特性
+
+* **CPU**：Unicorn 以 **ARM Thumb** 运行 Cortex-M0 代码
+* **时钟**：用"每条指令≈若干 CPU 周期"的近似推进 **VirtualClock**（虚拟时间）
+* **事件**：UART 位时序、定时器到期等，都挂在 **EventLoop**（小顶堆）上，**到期才触发**（跳时）
+* **WFI**：遇到 `WFI` 指令，**直接把虚拟时间跳到下个事件**，事件若产生可用中断/状态就"唤醒"继续跑
+* **UART**：支持按 `baud` 逐位"播放"TX 帧（start/data/parity/stop），寄存器可用简化的 16550 风格
+
+### 虚拟时钟和事件系统
+
+`soc/vclock.py` 实现了基于指令计数的虚拟时钟：
 
 ```python
-class Uart:
-    # 简化寄存器映射
-    THR = 0x00  # Transmit Holding Register
+class VirtualClock:
+    def __init__(self, ips=80_000_000):  # 80M 指令/秒
+        self.t = 0.0       # 虚拟秒
+        self.ips = float(ips)
+        self._insn_acc = 0
 
-    def __init__(self, base=0x4000_1000):
-        self.base = base
-        self.buf = []
+    def on_insn(self, n=1):
+        self._insn_acc += n
 
-    def in_range(self, addr):
-        return self.base <= addr < (self.base + 0x1000)
+    def flush(self):
+        if self._insn_acc:
+            self.t += self._insn_acc / self.ips
+            self._insn_acc = 0
 
-    def write(self, addr, size, value):
-        off = addr - self.base
-        if off == self.THR:
-            ch = value & 0xFF
-            self.buf.append(ch)
-            if ch == 0x0A or len(self.buf) > 256:  # 行缓冲
-                s = bytes(self.buf).decode(errors="replace")
-                print(f"[UART] {s}", end="")
-                self.buf.clear()
-            return True
-        return False
+class EventLoop:
+    def __init__(self, now_fn):
+        self.heap = []
+        self.now = now_fn
+        self._id = 0
 
-    def read(self, addr, size):
-        # 简化：没有RX，返回0
-        return 0
+    def schedule_at(self, t, cb):
+        self._id += 1
+        item = [t, self._id, cb, True]
+        heapq.heappush(self.heap, item)
+        return item
+
+    def next_deadline(self):
+        return self.heap[0][0] if self.heap else float('inf')
+
+    def run_due(self):
+        now = self.now()
+        while self.heap and self.heap[0][0] <= now:
+            t, _, cb, alive = heapq.heappop(self.heap)
+            if alive:
+                cb(t)
+```
+
+### 带时序的 UART
+
+`soc/uart_timing.py` 实现了真实的串口时序：
+
+```python
+class UartTiming:
+    # 16550风格的最小寄存器子集（只做 TX）
+    THR = 0x00  # 写入=发送
+    IER = 0x04  # 中断使能（用作占位）
+    LSR = 0x14  # 线路状态
+    LSR_THRE = 1 << 5  # THR Empty (TX FIFO 空)
+
+    # 波特率配置简化：DLL/DLM
+    DLL = 0x00; DLM = 0x04  # 复用：当 LCR.DLAB=1 时访问
+    LCR = 0x0C; LCR_DLAB = 1 << 7
+
+    def __init__(self, base, evloop, now_fn, irq_cb=None, pclk=24_000_000):
+        # 支持波特率配置和位时间计算
+        # 按位时间事件推进传输
+```
+
+特性：
+- 按位时间事件推进传输
+- 支持波特率配置（通过 DLL/DLM 寄存器）
+- 帧格式：start bit + data bits + stop bits
+- 轮询式状态检查（LSR.THRE）
+
+### WFI 指令处理
+
+在 `run_cm0.py` 中，代码钩子检测 WFI 指令：
+
+```python
+# Thumb: WFI = 0xBF30 (小端)
+WFI_THUMB = b"\x30\xBF"
+
+def on_code(mu_, addr, size, _):
+    try:
+        insn = bytes(mu_.mem_read(addr, 2))
+        if insn == WFI_THUMB:
+            # 停机，跳时到下一事件
+            mu_.emu_stop()
+            t_next = ev.next_deadline()
+            if t_next != float('inf'):
+                vclk.flush()
+                vclk.t = t_next
+                ev.run_until(t_next)
+                # 从 WFI 的下一条继续
+                mu_.reg_write(UC_ARM_REG_PC, addr + 2)
+    except UcError:
+        pass
+```
+
+### 编译和运行
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 编译 Cortex-M0 固件
+cd fw
+./build_cm0.sh
+
+# 运行 Cortex-M0 原型
+cd ..
+python3 run_cm0.py fw/hello_cm0.elf
+
+# 使用简单 UART（即时输出，用于调试）
+python3 run_cm0.py fw/hello_cm0.elf --simple
+```
+
+### 输出示例
+
+```
+[BOOT] SP=0x2001FF00, PC=0x0000002D
+[BOOT] FLASH mapped: 0x00000000 - 0x000FFFFF
+[BOOT] RAM mapped: 0x20000000 - 0x2001FFFF
+Hello from Cortex-M0 + Unicorn!
+[CPU] Breakpoint/exception at PC=0x00000032, stopping emulation
 ```
 
 ---
 
-# 2) 简易总线：把 MMIO 分给设备
+## ARMv7 原型（原有功能）
 
-`soc/bus.py`
+### 运行 ARMv7 示例
+
+```bash
+# 编译 ARMv7 固件
+cd fw
+./build.sh
+
+# 运行 ARMv7 原型
+cd ..
+python3 run.py fw/hello.elf
+```
+
+### 输出示例
+
+```
+[BOOT] entry=0x00010000, sp=0x00120000
+[UART] Hello, ARMv7 + Unicorn!
+[CPU] interrupt/break @ PC=0x0001001c, int=7
+```
+
+---
+
+## 架构说明
+
+### 总线和设备
+
+`soc/bus.py` 实现简易地址解码：
 
 ```python
 class Bus:
     def __init__(self, devices):
-        self.devs = devices  # 列表：有 in_range()/read()/write()
+        self.devs = devices
 
     def mmio_write(self, addr, size, value):
         for d in self.devs:
             if d.in_range(addr):
                 return d.write(addr, size, value)
-        return False  # 让 CPU 自己处理（例如写到RAM时返回False）
+        return False
 
     def mmio_read(self, addr, size):
         for d in self.devs:
             if d.in_range(addr):
                 return d.read(addr, size)
-        return None     # None 表示未处理
+        return None
 ```
+
+### 内存映射
+
+**Cortex-M0 内存映射：**
+- FLASH: 0x00000000 - 0x000FFFFF (1MB)
+- RAM: 0x20000000 - 0x2001FFFF (128KB)
+- MMIO: 0x40000000 - 0x4FFFFFFF (256MB)
+- UART0: 0x40001000
+
+**ARMv7 内存映射：**
+- RAM: 0x10000 - 0x20FFFF (2MB)
+- MMIO: 0x40000000 - 0x4000FFFF (64KB)
+- UART: 0x40001000
 
 ---
 
-# 3) CPU 封装（Unicorn ARMv7）
+## 开发说明
 
-`soc/cpu.py`
+### 添加新外设
 
-```python
-from unicorn import Uc, UC_ARCH_ARM, UC_MODE_ARM, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_HOOK_INTR
-from unicorn.arm_const import *
+1. 在 `soc/` 目录下创建外设类
+2. 实现 `in_range()`, `read()`, `write()` 方法
+3. 在 `run_cm0.py` 或 `run.py` 中添加到总线
 
-class Armv7CPU:
-    def __init__(self, ram_base=0x10000, ram_size=0x200000):
-        self.mu = Uc(UC_ARCH_ARM, UC_MODE_ARM)
-        self.ram_base = ram_base
-        self.ram_size = ram_size
-        self.mu.mem_map(self.ram_base, self.ram_size)
+### 时序仿真
 
-    def load_blob(self, addr, blob: bytes):
-        self.mu.mem_write(addr, blob)
+事件驱动原型支持：
+- 指令级时间模拟
+- 外设时序事件
+- WFI 低功耗模拟
+- 中断和事件唤醒
 
-    def set_pc_sp(self, pc, sp):
-        self.mu.reg_write(UC_ARM_REG_PC, pc)
-        self.mu.reg_write(UC_ARM_REG_SP, sp)
+### 调试技巧
 
-    def add_mmio_hooks(self, bus):
-        def on_write(mu, access, addr, size, value, _):
-            handled = bus.mmio_write(addr, size, value)
-            return handled  # True=已处理，False=交还Unicorn
-
-        def on_read(mu, access, addr, size, value, _):
-            res = bus.mmio_read(addr, size)
-            if res is None:
-                return False  # 交还Unicorn（如RAM）
-            # 告诉 Unicorn 此次读的返回值
-            mu.mem_write(addr, (res & ((1 << (size*8)) - 1)).to_bytes(size, 'little'))
-            return True
-
-        self.mu.hook_add(UC_HOOK_MEM_WRITE, on_write)
-        self.mu.hook_add(UC_HOOK_MEM_READ, on_read)
-
-        def on_intr(mu, intno, _):
-            # 碰到 BKPT 等异常时停机
-            print(f"[CPU] interrupt/break @ PC=0x{mu.reg_read(UC_ARM_REG_PC):08x}, int={intno}")
-            mu.emu_stop()
-        self.mu.hook_add(UC_HOOK_INTR, on_intr)
-
-    def run_until(self, start, end=None):
-        self.mu.emu_start(start, end if end else 0)  # end=0 表示不限定结束地址
-```
-
----
-
-# 4) 入口脚本：装载固件，跑起来
-
-`run.py`
-
-```python
-import sys
-from soc.cpu import Armv7CPU
-from soc.bus import Bus
-from soc.uart import Uart
-
-# 固件加载：支持 .bin 或 .elf（用 pyelftools 读入口点）
-def load_firmware(path):
-    if path.endswith(".bin"):
-        with open(path, "rb") as f:
-            blob = f.read()
-        return {"entry": 0x10000, "sp": 0x120000, "image": (0x10000, blob)}
-    elif path.endswith(".elf"):
-        from elftools.elf.elffile import ELFFile
-        with open(path, "rb") as f:
-            elf = ELFFile(f)
-            entry = elf.header["e_entry"]
-            # 简化：把所有 PT_LOAD 段写入内存
-            images = []
-            for seg in elf.iter_segments():
-                if seg["p_type"] == "PT_LOAD":
-                    vaddr = seg["p_vaddr"]
-                    data  = seg.data()
-                    images.append((vaddr, data))
-            # 栈指针：若你的启动代码自己设置，这里给个临时值
-            sp = 0x120000
-            return {"entry": entry, "sp": sp, "image": images}
-    else:
-        raise SystemExit("firmware must be .bin or .elf")
-
-def main():
-    fw = sys.argv[1] if len(sys.argv) > 1 else "fw/hello.elf"
-    info = load_firmware(fw)
-
-    cpu  = Armv7CPU()
-    uart = Uart(base=0x40001000)
-    bus  = Bus([uart])
-
-    for addr, blob in info["image"]:
-        cpu.load_blob(addr, blob)
-
-    cpu.set_pc_sp(info["entry"], info["sp"])
-    cpu.add_mmio_hooks(bus)
-
-    print(f"[BOOT] entry=0x{info['entry']:08x}, sp=0x{info['sp']:08x}")
-    cpu.run_until(info["entry"], end=None)
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-# 5) 裸机 “Hello, World” 固件（ARMv7-A）
-
-`fw/hello.c`（**极简**：把字符串逐字节写到 UART\_THR，最后触发 BKPT 停机）
-
-```c
-// 假定 ARMv7-A，MMU未开，向 0x40001000 写即为串口发送
-#define UART_BASE   0x40001000
-#define UART_THR    (*(volatile unsigned int*)(UART_BASE + 0x00))
-
-static void puts(const char* s) {
-    while (*s) {
-        UART_THR = (unsigned int)(unsigned char)(*s++);
-    }
-    UART_THR = '\n';
-}
-
-int main(void) {
-    puts("Hello, ARMv7 + Unicorn!");
-    // 触发 BKPT 方便 Unicorn 停机
-    __asm__ __volatile__("bkpt #0");
-    while (1) { }
-    return 0;
-}
-```
-
-`fw/build.sh`
-
-```bash
-#!/usr/bin/env bash
-set -e
-arm-none-eabi-gcc -mcpu=cortex-a9 -marm -nostdlib -ffreestanding -Os \
-  -Wl,-Ttext=0x10000 -Wl,--build-id=none \
-  hello.c -o hello.elf
-
-# 可选：也产出原始bin
-arm-none-eabi-objcopy -O binary hello.elf hello.bin
-echo "built: fw/hello.elf (entry=0x10000)"
-```
-
-> 说明
->
-> * 我们把链接地址放到 `0x10000`，与 `run.py` 里的 RAM 基址一致。
-> * 真实工程中你会有启动码（向量表、C 运行时初始化等），这里为了演示直接把 `main` 放在 `0x10000` 运行。
-> * `bkpt #0` 能让 Unicorn 触发 `UC_HOOK_INTR`，从而结束仿真。
-
----
-
-## 运行
-
-```bash
-pip install -r requirements.txt
-cd fw && bash build.sh && cd ..
-python run.py fw/hello.elf
-```
-
-你应该看到：
-
-```
-[BOOT] entry=0x00010000, sp=0x00120000
-[UART] Hello, ARMv7 + Unicorn!
-[CPU] interrupt/break @ PC=0x000100XX, int=...
-```
-
+- 使用 `--simple` 参数启用即时 UART 输出
+- 查看内存映射和加载调试信息
+- 使用 `arm-none-eabi-objdump` 分析生成的固件
+- 检查向量表和启动代码
