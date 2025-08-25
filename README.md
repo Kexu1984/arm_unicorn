@@ -1,8 +1,12 @@
-# arm_unicorn
-A unicorn virtual device with a basic peripheral.
 
-# folder structure:
+这是一款基于unicorn的虚拟原型项目。
+项目骨架：目录结构、依赖、最小可跑代码（CPU+MMIO UART），以及如何编译一段裸机 “Hello, World” 固件喂给它运行。
 
+---
+
+# 目录结构（建议）
+
+```
 armv7_unicorn/
 ├─ requirements.txt
 ├─ run.py                  # 入口：装载固件、跑CPU、串口输出
@@ -14,9 +18,23 @@ armv7_unicorn/
 └─ fw/
    ├─ hello.c              # 裸机例子（写MMIO UART）
    └─ build.sh             # 用 arm-none-eabi-gcc 编译
+```
 
-# MMIO UART
-## soc/uart.py
+`requirements.txt`
+
+```
+unicorn
+capstone
+pyelftools
+```
+
+---
+
+# 1) 最小外设：MMIO UART（Python）
+
+`soc/uart.py`
+
+```python
 class Uart:
     # 简化寄存器映射
     THR = 0x00  # Transmit Holding Register
@@ -43,8 +61,15 @@ class Uart:
     def read(self, addr, size):
         # 简化：没有RX，返回0
         return 0
+```
 
-## soc/bus.py
+---
+
+# 2) 简易总线：把 MMIO 分给设备
+
+`soc/bus.py`
+
+```python
 class Bus:
     def __init__(self, devices):
         self.devs = devices  # 列表：有 in_range()/read()/write()
@@ -60,9 +85,15 @@ class Bus:
             if d.in_range(addr):
                 return d.read(addr, size)
         return None     # None 表示未处理
+```
 
+---
 
-## soc/cpu.py
+# 3) CPU 封装（Unicorn ARMv7）
+
+`soc/cpu.py`
+
+```python
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_ARM, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_HOOK_INTR
 from unicorn.arm_const import *
 
@@ -104,8 +135,15 @@ class Armv7CPU:
 
     def run_until(self, start, end=None):
         self.mu.emu_start(start, end if end else 0)  # end=0 表示不限定结束地址
+```
 
-## run.py
+---
+
+# 4) 入口脚本：装载固件，跑起来
+
+`run.py`
+
+```python
 import sys
 from soc.cpu import Armv7CPU
 from soc.bus import Bus
@@ -154,9 +192,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
 
+---
 
-## fw/hello.c
+# 5) 裸机 “Hello, World” 固件（ARMv7-A）
+
+`fw/hello.c`（**极简**：把字符串逐字节写到 UART\_THR，最后触发 BKPT 停机）
+
+```c
 // 假定 ARMv7-A，MMU未开，向 0x40001000 写即为串口发送
 #define UART_BASE   0x40001000
 #define UART_THR    (*(volatile unsigned int*)(UART_BASE + 0x00))
@@ -175,8 +219,11 @@ int main(void) {
     while (1) { }
     return 0;
 }
+```
 
-## fw/build.sh
+`fw/build.sh`
+
+```bash
 #!/usr/bin/env bash
 set -e
 arm-none-eabi-gcc -mcpu=cortex-a9 -marm -nostdlib -ffreestanding -Os \
@@ -186,16 +233,29 @@ arm-none-eabi-gcc -mcpu=cortex-a9 -marm -nostdlib -ffreestanding -Os \
 # 可选：也产出原始bin
 arm-none-eabi-objcopy -O binary hello.elf hello.bin
 echo "built: fw/hello.elf (entry=0x10000)"
+```
 
-run:
+> 说明
+>
+> * 我们把链接地址放到 `0x10000`，与 `run.py` 里的 RAM 基址一致。
+> * 真实工程中你会有启动码（向量表、C 运行时初始化等），这里为了演示直接把 `main` 放在 `0x10000` 运行。
+> * `bkpt #0` 能让 Unicorn 触发 `UC_HOOK_INTR`，从而结束仿真。
+
+---
+
+## 运行
+
+```bash
 pip install -r requirements.txt
 cd fw && bash build.sh && cd ..
 python run.py fw/hello.elf
+```
 
+你应该看到：
 
-result:
+```
 [BOOT] entry=0x00010000, sp=0x00120000
 [UART] Hello, ARMv7 + Unicorn!
 [CPU] interrupt/break @ PC=0x000100XX, int=...
-
+```
 
