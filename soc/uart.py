@@ -1,6 +1,8 @@
 class Uart:
     # 简化寄存器映射
     THR = 0x00  # Transmit Holding Register
+    LSR = 0x14  # Line Status Register
+    LSR_THRE = 1 << 5  # THR Empty
 
     def __init__(self, base=0x40001000):
         self.base = base
@@ -14,13 +16,17 @@ class Uart:
         if off == self.THR:
             ch = value & 0xFF
             self.buf.append(ch)
-            if ch == 0x0A or len(self.buf) > 256:  # 行缓冲
-                s = bytes(self.buf).decode(errors="replace")
-                print(f"[UART] {s}", end="")
-                self.buf.clear()
+            # More aggressive output - print immediately for debugging
+            print(chr(ch), end='')
+            if ch == 0x0A:  # Also flush on newlines
+                import sys
+                sys.stdout.flush()
             return True
         return False
 
     def read(self, addr, size):
-        # 简化：没有RX，返回0
+        off = addr - self.base
+        if off == self.LSR:
+            return self.LSR_THRE  # Always ready to transmit
+        # 简化：没有RX，其他寄存器返回0
         return 0

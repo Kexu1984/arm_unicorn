@@ -68,17 +68,19 @@ class UartTiming:
 
     def _on_bit_edge(self, now):
         bit = self.cur_bits.pop(0)
-        # Output transmitted character when we complete a frame
-        if len(self.cur_bits) == 0:  # Frame complete
-            # Find the transmitted byte by looking at data bits (bits 1-8)
-            byte_bits = self._frame_bits((self.tx_fifo + [0])[-1] if hasattr(self, '_last_byte') else 0)[1:9]
-            if hasattr(self, '_last_byte'):
-                print(chr(self._last_byte), end='')
+        # Optional: trace bit transmission timing
+        # print(f"[UART TX] t={now:.6f}s bit={bit}")
         
         if self.cur_bits:
             self.next_ev = self.ev.schedule_at(now + self.bit_t, self._on_bit_edge)
         else:
+            # Frame transmission complete
             self.sending = False
+            # Output the completed character
+            if hasattr(self, '_last_byte'):
+                import sys
+                print(chr(self._last_byte), end='')
+                sys.stdout.flush()  # Force immediate output
             # 连续发送
             self._kick()
 
