@@ -25,13 +25,11 @@ def load_elf_into(mu, path):
                 vaddr = seg['p_vaddr']
                 data  = seg.data()
                 if len(data) > 0:  # Only load non-empty segments
-                    print(f"[ELF] Loading segment: 0x{vaddr:08X} size={len(data)} bytes")
                     mu.mem_write(vaddr, data)
         entry = elf.header['e_entry']
     # Cortex-M 启动：向量表[0]=MSP, [1]=Reset
     sp = int.from_bytes(mu.mem_read(FLASH_BASE + 0, 4), "little")
     pc = int.from_bytes(mu.mem_read(FLASH_BASE + 4, 4), "little") | 1  # Thumb bit
-    print(f"[ELF] Entry point: 0x{entry:08X}, Vector SP: 0x{sp:08X}, Vector PC: 0x{pc:08X}")
     return entry, sp, pc
 
 def main(fw="fw/hello_cm0.elf"):
@@ -132,10 +130,6 @@ def main(fw="fw/hello_cm0.elf"):
     print(f"[BOOT] SP=0x{sp:08X}, PC=0x{pc:08X}")
     print(f"[BOOT] FLASH mapped: 0x{FLASH_BASE:08X} - 0x{FLASH_BASE + FLASH_SIZE - 1:08X}")
     print(f"[BOOT] RAM mapped: 0x{RAM_BASE:08X} - 0x{RAM_BASE + RAM_SIZE - 1:08X}")
-    
-    # Debug: examine memory content at specific addresses to verify code is loaded correctly
-    code_at_pc = mu.mem_read(pc & ~1, 16)  # Read 16 bytes at PC location
-    print(f"[DEBUG] Code at PC 0x{pc & ~1:08X}: {code_at_pc.hex()}")
     
     try:
         mu.emu_start(pc, 0)  # 跑到 BKPT/异常/我们手动 emu_stop
