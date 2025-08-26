@@ -275,14 +275,19 @@ class GDBServer:
     
     def cmd_continue(self, args: str) -> str:
         """Continue execution"""
-        # Start execution in a separate thread
-        def run_cpu():
-            self.cpu.continue_execution()
+        print("[GDB] Continue execution requested")
+        self.cpu.continue_execution()
         
-        thread = threading.Thread(target=run_cpu, daemon=True)
-        thread.start()
-        # Don't send immediate response - will send stop packet when stopped
-        return None
+        # Wait a bit to see if execution stops quickly
+        import time
+        time.sleep(0.1)
+        
+        if self.cpu.stopped:
+            return self.cmd_halt_reason()
+        else:
+            # Still running, don't send response yet
+            # Will need to send stop packet when it actually stops
+            return None
     
     def cmd_step(self, args: str) -> str:
         """Single step execution"""

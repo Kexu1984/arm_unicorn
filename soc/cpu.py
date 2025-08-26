@@ -163,20 +163,34 @@ class Armv7CPU:
     
     def continue_execution(self):
         """Continue execution from current PC"""
+        print(f"[CPU] Continuing execution from PC=0x{self.mu.reg_read(UC_ARM_REG_PC):08x}")
         self.stopped = False
         self.stop_reason = "unknown"
         pc = self.mu.reg_read(UC_ARM_REG_PC)
         try:
             self.mu.emu_start(pc, 0)
-        except:
-            pass  # Emulation stopped
+            # If we get here, emulation ended
+            if not self.stopped:
+                self.stopped = True
+                self.stop_reason = "exited"
+        except Exception as e:
+            print(f"[CPU] Emulation error: {e}")
+            self.stopped = True
+            self.stop_reason = "error"
     
     def single_step_execution(self):
         """Execute one instruction"""
+        print(f"[CPU] Single step from PC=0x{self.mu.reg_read(UC_ARM_REG_PC):08x}")
         self.single_step = True
         self.stopped = False
         pc = self.mu.reg_read(UC_ARM_REG_PC)
         try:
             self.mu.emu_start(pc, 0)
-        except:
-            pass  # Emulation stopped
+            # If we get here, emulation ended without single step completing
+            if not self.stopped:
+                self.stopped = True
+                self.stop_reason = "step"
+        except Exception as e:
+            print(f"[CPU] Single step error: {e}")
+            self.stopped = True
+            self.stop_reason = "step"
